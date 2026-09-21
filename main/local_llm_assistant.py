@@ -1,380 +1,807 @@
-import sys
-import os
-import time
+"""
+Lemun Enterprises - Local LLM Assistant
+
+Python half of the app. password_gate.cpp handles authentication, then
+launches this script with its own install directory as argv[1].
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import sqlite3
 import subprocess
-from pathlib import Path  # Claude - comment: needed for install-root-anchored paths, replacing bare relative strings
+import sys
+import time
+import traceback
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Iterable, Optional
 
-try:
-    import openvino
-    import openvino_genai as ov_genai
-    from openvino import Core
 
-    core = Core()
+# ============================================================
+# PATHS
+# ============================================================
 
-except ImportError:
-    print("OpenVINO isn't installed!")
-    choice = input("Install it now automatically via pip? (y/n): ").strip().lower()
+def resolve_install_root() -> Path:
+    if len(sys.argv) > 1:
+        return Path(sys.argv[1]).resolve()
+    return Path(__file__).resolve().parent
 
-    if choice == "y":
-        try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "openvino", "openvino-genai"]
+
+INSTALL_ROOT = resolve_install_root()
+MODELS_DIR = INSTALL_ROOT / "download_model_OpenVINO" / "models"
+DATA_DIR = INSTALL_ROOT / "data"
+MEMORY_DB_PATH = DATA_DIR / "memory.db"
+CRASH_LOG_PATH = DATA_DIR / "crash.log"
+
+MAX_NEW_TOKENS = 2048
+MODEL_MARKER_FILE = "openvino_model.xml"
+APP_TITLE = "Welcome - Lemun Enterprises"
+
+
+# ============================================================
+# UTILITIES
+# ============================================================
+
+class AssistantError(Exception):
+    """A user-facing, recoverable failure."""
+
+
+def print_banner() -> None:
+    width = 40
+    print("=" * width)
+    print("|" + " " * (width - 2) + "|")
+    print("|" + APP_TITLE.center(width - 2) + "|")
+    print("|" + " " * (width - 2) + "|")
+    print("=" * width)
+
+
+def print_footer() -> None:
+    print("\nSession ended. Thanks for using the assistant.")
+    print("Copyright Product : Avoid Unfair Use and Follow the Code of Conduct")
+
+
+def format_bytes(num_bytes: Optional[int]) -> str:
+    if num_bytes is None:
+        return "unknown"
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024.0 or unit == "TB":
+            return f"{size:.2f} {unit}"
+        size /= 1024.0
+    return f"{size:.2f} TB"
+
+
+def folder_size_bytes(path: Path) -> int:
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+
+
+def has_internet(url: str = "https://huggingface.co", timeout: float = 5.0) -> bool:
+    import urllib.error
+    import urllib.request
+
+    try:
+        urllib.request.urlopen(urllib.request.Request(url, method="HEAD"), timeout=timeout)
+        return True
+    except urllib.error.HTTPError:
+        return True  # server responded at all, so the network path is fine
+    except Exception:
+        return False
+
+
+def log_error(context: str, exc: BaseException) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(CRASH_LOG_PATH, "a", encoding="utf-8") as log_file:
+            log_file.write(f"\n{'=' * 60}\n")
+            log_file.write(f"{datetime.now().isoformat(timespec='seconds')} - {context}\n")
+            log_file.write(f"{'=' * 60}\n")
+            log_file.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+    except Exception:
+        pass  # logging must never itself be the thing that crashes
+
+
+def pause_before_exit() -> None:
+    print(f"\nDetails were written to:\n  {CRASH_LOG_PATH}")
+    try:
+        input("\nPress Enter to close this window...")
+    except (EOFError, KeyboardInterrupt, OSError):
+        pass
+
+
+def pip_install(*packages: str) -> None:
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", *packages])
+    except subprocess.CalledProcessError as exc:
+        raise AssistantError(
+            f"Automatic install failed (exit code {exc.returncode}).\n"
+            f"Please run manually:  pip install {' '.join(packages)}"
+        ) from exc
+    except OSError as exc:
+        raise AssistantError(f"Could not start pip: {exc}") from exc
+
+
+# ============================================================
+# OPENVINO ENVIRONMENT
+# ============================================================
+
+openvino = None
+ov_genai = None
+core = None
+
+
+def ensure_openvino() -> None:
+    global openvino, ov_genai, core
+
+    try:
+        import openvino as openvino_module
+        import openvino_genai as genai_module
+    except ImportError:
+        print("OpenVINO isn't installed!")
+        answer = input("Install it now automatically via pip? (y/n): ").strip().lower()
+
+        if answer != "y":
+            raise AssistantError(
+                "OpenVINO is required to run this assistant.\n"
+                "To install, run:  pip install openvino openvino-genai"
             )
-            # re-import after install so the rest of the script can use them
-            import openvino
-            import openvino_genai as ov_genai
-            from openvino import Core
 
-            core = Core()
-            print("\nOpenVINO installed successfully. Continuing...\n")
+        pip_install("openvino", "openvino-genai")
 
-        except subprocess.CalledProcessError as e:
-            print(f"\nAuto-install failed: {e}")
-            print("Please run manually: pip install openvino openvino-genai")
-            sys.exit(1)
-    else:
-        print("To install Run CMD:")
-        print("pip install openvino openvino-genai")
-        sys.exit(1)
+        try:
+            import openvino as openvino_module
+            import openvino_genai as genai_module
+        except ImportError as exc:
+            raise AssistantError(
+                "OpenVINO installed but still cannot be imported.\n"
+                "Try restarting the application."
+            ) from exc
 
+        print("\nOpenVINO installed successfully. Continuing...\n")
 
-# -- Import ends and codebase starts! --
-# -- Tried and worked for 2 whole hrs for refactoring this.. --
+    openvino = openvino_module
+    ov_genai = genai_module
 
-# ============================================================================
-# Claude - comment: INSTALL ROOT RESOLUTION
-# password_gate.cpp now launches this script with its own resolved exe
-# directory as argv[1] (see the C++ fix from earlier), so both halves of the
-# app agree on one "where do I live" answer instead of guessing separately.
-# Falls back to this script's own folder when run standalone during dev
-# (e.g. testing this file directly without going through the C++ gate),
-# so nothing breaks while you're iterating on this half alone.
-# ============================================================================
-if len(sys.argv) > 1:
-    INSTALL_ROOT = Path(sys.argv[1]).resolve()
-else:
-    INSTALL_ROOT = Path(__file__).resolve().parent
-
-MODELS_DIR = INSTALL_ROOT / "download_model_OpenVINO" / "models"  # Claude - comment: FIXED - was INSTALL_ROOT/"models", one level too shallow. This now matches your own FOR THIS FOLDER SPECIFICALLY.txt, which specifies models live nested under download_model_OpenVINO/models/, not directly under the install root.
+    try:
+        core = openvino.Core()
+    except Exception as exc:
+        raise AssistantError(f"OpenVINO loaded but failed to initialise: {exc}") from exc
 
 
-def banner():
-    print("=" * 40)
-    print("|" + " " * 38 + "|")
-    print("|" + " " * 6 + "Welcome - Lemun Enterprises" + " " * 5 + "|")
-    print("=" * 40)
-    return
+def detect_devices() -> tuple[str, ...]:
+    try:
+        return tuple(core.available_devices)
+    except Exception as exc:
+        print(f"Couldn't read device info: {exc}")
+        return ()
 
-# def changepass():
-#     while(True):
-#         choice = input("Do you want to change current password? (y/n): ").strip().lower()
-#         if(choice=="y"):
-#             __path__("\change_password.cpp")
-#             break
-#         else:
-#             break
 
-def devices():
+def print_environment() -> tuple[str, ...]:
     try:
         print("OpenVINO version:", openvino.__version__)
-        print("Available devices:", core.available_devices)
-    except Exception as e:
-        print(f"Couldn't read device info: {e}")
-    return
+    except Exception:
+        print("OpenVINO version: unknown")
+
+    devices = detect_devices()
+    print("Available devices:", ", ".join(devices) if devices else "none detected")
+    return devices
 
 
-# -- NOTE that this "localmodels" function must be updated - if suppose you add 16Billion parameter model
-
-def localmodels():
-    # Claude - comment: paths are now built from MODELS_DIR (install-root-anchored,
-    # nested under download_model_OpenVINO/models/ per your own folder convention)
-    # instead of a hardcoded relative string, and each entry carries its real
-    # Hugging Face repo id under "hf_repo" so ensure_base_model() below knows
-    # exactly what to fetch — matches your own verified-working download script
-    # at download_model_OpenVINO/Qwen2.5-1.5B-Instruct-int4-ov.py exactly.
-    MODELS = {
-                # == DEFAULT MODEL BELOW ==
-                # == MUST BE DOWNLOADED DURING 1st INSTALLATION OF THE MODEL - HENCE INTERNET FOR THE FIRST TIME DURING APP DOWNLOAD IS MANDATORY
-                "Qwen2.5-1.5B-Instruct-int4-ov":
-                {"name":"Qwen2.5-1.5B-Instruct-int4-ov",
-                 "company":"Alibaba",
-                 "country":"China",
-                 "path": str(MODELS_DIR / "Qwen2.5-1.5B-Instruct-int4-ov"),  # Claude - comment: was a bare relative string, now install-root-anchored
-                 "hf_repo": "llmware/qwen2.5-1.5b-instruct-ov",              # Claude - comment: FIXED - was a different repo I'd found while researching (OpenVINO/Qwen2.5-1.5B-Instruct-int4-ov), which doesn't match what your own download_model_OpenVINO/Qwen2.5-1.5B-Instruct-int4-ov.py actually uses. This now matches your verified-working script exactly, so the automatic first-run download and your manual per-model scripts always agree.
-                 "supports":"CPU,GPU"
-                 }
-            #   # IF ADDED YOU ADD MODEL HERE MANUALLY!! yeah pls no shit do some hardwork man... - its your flagship project - im lazy will update in v2 with automation.
-            #   ,"qwen2.5-coder-3b":
-            #   {"name": "Qwen2.5 Coder 3B",
-            #    "company":"Alibaba",
-            #    "country":"China",
-            #    "path": "download_model_OpenVINO/models/Qwen2.5-Coder-3B-Instruct-int4-ov",
-            #    "supports": "CPU,GPU"
-            #    # yes all supports of models were tested beforehand on ASUS VIVOBOOK S14 S5406SA Intel Core Ultra 5 226v w/ 130V ARC IGPU + 40 TOPS NPU
-            #    },
-            #   "qwen3-8b":
-            #   {"name": "Qwen3 8B",
-            #    "company":"Alibaba",
-            #    "country":"China",
-            #    "path": "download_model_OpenVINO/models/Qwen3-8B-int4-cw-ov",
-            #    "supports": "CPU,GPU,NPU"
-            #    },
-            #    "Llama-3.2-1B-Instruct-int4-ov":
-            #    {"name": "Llama-3.2-1B-Instruct-int4-ov",
-            #     "company":"Meta",
-            #     "country":"United States",
-            #     "path":"download_model_OpenVINO/models/Llama-3.2-1B-Instruct-int4-ov",
-            #     "supports":"CPU,GPU"
-            #     }
-              }
-    # returning it now instead of just printing so main() can actually use it
-    return MODELS
+def stream_continue_value():
+    streaming_status = getattr(ov_genai, "StreamingStatus", None)
+    if streaming_status is not None:
+        return streaming_status.RUNNING
+    return False
 
 
-# ============================================================================
-# Claude - comment: MANDATORY FIRST-RUN BASE MODEL DOWNLOAD
-# This is the piece that turns "download_model_OpenVINO/models/... must exist
-# somehow" (the old TODO comment at the bottom of this file) into something
-# that actually runs. It blocks here on purpose — no menu, no chat, until the
-# default model is verifiably present — because the beta requirement is that
-# first install cannot proceed without it.
-# ============================================================================
+# ============================================================
+# MODEL CATALOG
+# ============================================================
 
-def _model_is_present(model_path: Path) -> bool:
-    # Claude - comment: OpenVINO IR models are a folder of files, not one
-    # single file — checking for openvino_model.xml specifically (rather than
-    # just the folder existing) catches a partial/interrupted previous
-    # download instead of trusting an empty or half-written folder.
-    return (model_path / "openvino_model.xml").exists()
+@dataclass(frozen=True)
+class LocalModel:
+    name: str
+    company: str
+    country: str
+    folder: str
+    hf_repo: str
+    supports: tuple[str, ...]
 
+    @property
+    def path(self) -> Path:
+        return MODELS_DIR / self.folder
 
-def ensure_base_model(model_info):
-    model_path = Path(model_info["path"])
+    @property
+    def is_installed(self) -> bool:
+        return (self.path / MODEL_MARKER_FILE).exists()
 
-    if _model_is_present(model_path):
-        return  # already downloaded, nothing to do
-
-    print(f"\nBase model '{model_info['name']}' not found - this is required before the app can run.")
-    print("Downloading now (this only happens once)...\n")
-
-    try:
-        import huggingface_hub
-    except ImportError:
-        # Claude - comment: same auto-install pattern already used for OpenVINO
-        # above, kept consistent rather than introducing a different style
-        print("The 'huggingface_hub' package is required to download the base model.")
-        choice = input("Install it now automatically via pip? (y/n): ").strip().lower()
-        if choice != "y":
-            print("Cannot continue without the base model. Exiting.")
-            sys.exit(1)
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "huggingface_hub"])
-            import huggingface_hub
-        except subprocess.CalledProcessError as e:
-            print(f"\nAuto-install failed: {e}")
-            print("Please run manually: pip install huggingface_hub")
-            sys.exit(1)
-
-    model_path.parent.mkdir(parents=True, exist_ok=True)  # Claude - comment: ensure models/ exists before the download writes into it
-
-    try:
-        # Claude - comment: snapshot_download handles partial-download resume
-        # and file integrity on its own - more reliable here than hand-rolling
-        # this with raw requests, and it prints its own progress bars.
-        huggingface_hub.snapshot_download(
-            repo_id=model_info["hf_repo"],
-            local_dir=str(model_path),
+    def describe(self) -> str:
+        state = "installed" if self.is_installed else "not installed"
+        return (
+            f"{self.name} - {self.company} - {self.country} "
+            f"(runs on: {', '.join(self.supports)}) [{state}]"
         )
-    except Exception as e:
-        print(f"\nBase model download failed: {e}")
-        print("Check your internet connection and try again - the app cannot run without this model.")
-        sys.exit(1)
-
-    if not _model_is_present(model_path):
-        print("\nDownload finished but the model files look incomplete. Please try again.")
-        sys.exit(1)
-
-    print(f"\nBase model '{model_info['name']}' downloaded successfully.\n")
 
 
-def modelchoice(models):
-    # user chooses models per session instead of every prompt -
-    # so basically they choose model only when they restart the application - no model change allowed until app closed. - for now follow this we will update later
+BASE_MODEL = LocalModel(
+    name="Qwen2.5-1.5B-Instruct-int4-ov",
+    company="Alibaba",
+    country="China",
+    folder="Qwen2.5-1.5B-Instruct-int4-ov",
+    hf_repo="llmware/qwen2.5-1.5b-instruct-ov",
+    supports=("CPU", "GPU"),
+)
 
-    print("\nAvailable Models:")
-    keys = list(models.keys())
-    for i, key in enumerate(keys, start=1):
-        info = models[key]
-        print(f"  {i}. {info['name']} - {info['company']} - {info['country']} - (supports: {info['supports']})")
+# I have added models here - these are done manually ofc - since i want to manually test and then add models so i know what they are capable of
 
-    model = None
-    while model is None:
+# IDEA_MODELS_ALL = ()
+# IMAGE_MODELS_ALL = ()
+# SPEECH_MODELS_ALL = ()
+# MUSIC_MODELS_ALL = ()
+
+IDEA_MODELS: tuple[LocalModel, ...] = (BASE_MODEL,)
+IMAGE_MODELS: tuple[LocalModel, ...] = ()
+SPEECH_MODELS: tuple[LocalModel, ...] = ()
+MUSIC_MODELS: tuple[LocalModel, ...] = ()
+
+
+def list_all_models() -> tuple[LocalModel, ...]:
+    unique: dict[str, LocalModel] = {}
+    for group in (IDEA_MODELS, IMAGE_MODELS, SPEECH_MODELS, MUSIC_MODELS):
+        for model in group:
+            unique[model.folder] = model
+    return tuple(unique.values())
+
+
+# ============================================================
+# MODEL MANAGEMENT
+# ============================================================
+
+def fetch_download_size(model: LocalModel) -> Optional[int]:
+    try:
+        from huggingface_hub import HfApi
+
+        info = HfApi().model_info(model.hf_repo, files_metadata=True)
+        return sum(sibling.size for sibling in info.siblings if sibling.size)
+    except Exception:
+        return None
+
+
+def ensure_huggingface_hub() -> None:
+    try:
+        import huggingface_hub  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    print("The 'huggingface_hub' package is required to download models.")
+    answer = input("Install it now automatically via pip? (y/n): ").strip().lower()
+
+    if answer != "y":
+        raise AssistantError(
+            "Cannot download models without huggingface_hub.\n"
+            "To install, run:  pip install huggingface_hub"
+        )
+
+    pip_install("huggingface_hub")
+
+
+def download_model(model: LocalModel) -> None:
+    if not has_internet():
+        raise AssistantError(
+            f"No internet connection detected.\n"
+            f"'{model.name}' still needs to be downloaded, so please connect "
+            f"to the internet and try again."
+        )
+
+    ensure_huggingface_hub()
+    import huggingface_hub
+    from huggingface_hub import snapshot_download
+
+    try:
+        model.path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise AssistantError(
+            f"Could not create the models folder at:\n  {model.path.parent}\n"
+            f"({exc})\n"
+            f"This can happen due to permissions, a very long install path, or "
+            f"special characters in a folder name."
+        ) from exc
+
+    print(f"\nDownloading {model.name}...")
+    print(f"(huggingface_hub version: {huggingface_hub.__version__})")
+    print("(This only happens once. Progress is shown below.)\n")
+
+    try:
+        snapshot_download(repo_id=model.hf_repo, local_dir=str(model.path))
+    except Exception as exc:
+        log_error(f"snapshot_download failed for '{model.name}'", exc)
+        raise AssistantError(
+            f"Download of '{model.name}' failed: {exc}\n"
+            f"Full details were written to:\n  {CRASH_LOG_PATH}\n"
+            f"Check your internet connection and try again."
+        ) from exc
+
+    if not model.is_installed:
+        raise AssistantError(
+            f"Download finished but '{model.name}' looks incomplete "
+            f"(missing {MODEL_MARKER_FILE}). Please try again."
+        )
+
+    print(f"\n{model.name} downloaded successfully.\n")
+
+
+def ensure_base_model() -> None:
+    if BASE_MODEL.is_installed:
+        return
+
+    print(f"\nBase model '{BASE_MODEL.name}' is not installed.")
+    print("This model is required for the assistant to work at all.\n")
+    print(f"Download size: {format_bytes(fetch_download_size(BASE_MODEL))}")
+
+    download_model(BASE_MODEL)
+
+
+def ensure_model_available(model: LocalModel) -> bool:
+    if model.is_installed:
+        return True
+
+    print(f"\n'{model.name}' is not installed yet.")
+    print(f"Download size: {format_bytes(fetch_download_size(model))}")
+
+    answer = input("Download it now? (y/n): ").strip().lower()
+    if answer != "y":
+        print("Skipped - returning to the menu.")
+        return False
+
+    download_model(model)
+    return True
+
+
+def uninstall_model(model: LocalModel) -> None:
+    try:
+        shutil.rmtree(model.path)
+    except OSError as exc:
+        raise AssistantError(f"Could not remove '{model.name}': {exc}") from exc
+
+
+# ============================================================
+# INFERENCE ENGINE
+# ============================================================
+
+def load_pipeline(model: LocalModel, device: str):
+    print(f"\nLoading {model.name} on {device}...")
+    started = time.perf_counter()
+
+    try:
+        pipeline = ov_genai.LLMPipeline(str(model.path), device)
+    except Exception as exc:
+        raise AssistantError(
+            f"Failed to load '{model.name}' on {device}: {exc}\n"
+            f"Check that the model folder exists at:\n  {model.path}"
+        ) from exc
+
+    print(f"Model loaded in {time.perf_counter() - started:.2f} seconds")
+    return pipeline
+
+
+class ChatSession:
+    """One conversation with a loaded model; owns its own history."""
+
+    def __init__(self, pipeline, max_new_tokens: int = MAX_NEW_TOKENS) -> None:
+        self.pipeline = pipeline
+        self.max_new_tokens = max_new_tokens
+        self.history = ov_genai.ChatHistory()
+        self._keep_going = stream_continue_value()
+
+    def ask(self, prompt: str, on_token: Callable[[str], None]) -> str:
+        self.history.append({"role": "user", "content": prompt})
+
+        config = ov_genai.GenerationConfig()
+        config.max_new_tokens = self.max_new_tokens
+
+        def streamer(chunk: str):
+            on_token(chunk)
+            return self._keep_going
+
         try:
-            raw = input("\nPick a model (number): ").strip()
-            idx = int(raw)
-            if 1 <= idx <= len(keys):
-                model = models[keys[idx - 1]]
-            else:
-                print(f"Enter a number between 1 and {len(keys)}.")
+            result = self.pipeline.generate(self.history, config, streamer)
+        except Exception as exc:
+            self.history.pop()
+            raise AssistantError(f"Generation failed: {exc}") from exc
+
+        reply = result.texts[0]
+        self.history.append({"role": "assistant", "content": reply})
+        return reply
+
+    @property
+    def turn_count(self) -> int:
+        return len(self.history) // 2
+
+
+# ============================================================
+# MEMORY / PERSISTENCE
+# ============================================================
+
+def save_session(feature_label: str, session: ChatSession, started_at: datetime) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(MEMORY_DB_PATH) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    feature TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT NOT NULL,
+                    turn_count INTEGER NOT NULL,
+                    history TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO sessions (feature, started_at, ended_at, turn_count, history) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    feature_label,
+                    started_at.isoformat(timespec="seconds"),
+                    datetime.now().isoformat(timespec="seconds"),
+                    session.turn_count,
+                    json.dumps(list(session.history)),
+                ),
+            )
+    except Exception as exc:
+        print(f"(Could not save this session to memory: {exc})")
+
+
+# ============================================================
+# CONSOLE UI
+# ============================================================
+
+def ask_choice(prompt: str, count: int, allow_back: bool = True) -> Optional[int]:
+    hint = f" (1-{count}, or 0 to go back)" if allow_back else f" (1-{count})"
+
+    while True:
+        try:
+            raw = input(f"{prompt}{hint}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+
+        if not raw:
+            continue
+
+        try:
+            choice = int(raw)
         except ValueError:
             print("That's not a number, try again.")
-
-    # user to pick between cpu,gpu,npu
-    supported = [d.strip().upper() for d in model["supports"].split(",")]
-    detected = core.available_devices
-
-    device = None
-    while device is None:
-        raw = input(f"Pick a device ({'/'.join(supported)}): ").strip().upper()
-        if raw not in supported:
-            print(f"'{model['name']}' only supports: {', '.join(supported)}")
             continue
-        if not any(raw in d for d in detected):
-            print(f"Heads up: OpenVINO doesn't see a {raw} on this machine ({detected}).")
-            confirm = input("Try loading it anyway? (y/n): ").strip().lower()
-            if confirm != "y":
-                continue
-        device = raw
 
-    return model, device
+        if allow_back and choice == 0:
+            return None
+        if 1 <= choice <= count:
+            return choice
 
-
-def load_pipeline(model, device):
-    print(f"\nLoading {model['name']} on {device}...")
-    load_start = time.perf_counter()
-
-    try:
-        pipe = ov_genai.LLMPipeline(model["path"], device)
-    except Exception as e:
-        print(f"\nFailed to load model: {e}")
-        print("Check that the model path exists and the device string is valid.")
-        # WHEN creating .exe be CAREFUL - THE MODEL MOSTLY WONT BE BUNDLED WITH THE EXE since it would make it very big - so we need a way to download the model too - after installation
-        # FOR TESTING PURPOSES AND FOR DEMO - people who like to test softwares - I recommmend that you keep a simple model like basic model bundled in - so it comes with atleast 1 model preinstalled.
-        # ALSO THE USER SHOULD HAVE THE OPTION TO DYNAMICALLY UNINSTALL THE MODELS HE doesnt want - unnecessary space hogging.
-        sys.exit(1)
-
-    print(f"Model loaded in {time.perf_counter() - load_start:.2f} seconds")
-    return pipe
+        print(f"Enter a number between {'0' if allow_back else '1'} and {count}.")
 
 
-def getresponse(pipe, chat_history, prompt):
-    # reveives input of user from userprompts function()
-    # this gets response from the localllm
+def choose_model(models: Iterable[LocalModel]) -> Optional[LocalModel]:
+    catalog = list(models)
 
-    # Claude - comment: start_chat()/finish_chat() is deprecated in current
-    # OpenVINO GenAI - the pipeline no longer holds conversation memory
-    # internally. We now hold it ourselves in chat_history and pass the
-    # whole thing into generate() every turn, per Intel's current chat-scenario
-    # docs (openvinotoolkit.github.io/openvino.genai/docs/guides/chat-scenario).
-    chat_history.append({"role": "user", "content": prompt})
+    if not catalog:
+        print("\nNo models are configured for this feature yet.")
+        return None
 
-    # dynamic tokens: we don't force a fixed length, the model stops itself on EOS.
-    # max_new_tokens here is just a safety ceiling so one bad turn can't run forever.
-    gen_config = ov_genai.GenerationConfig()
-    gen_config.max_new_tokens = 2048
+    print("\nAvailable models:")
+    for index, model in enumerate(catalog, start=1):
+        print(f"  {index}. {model.describe()}")
 
-    print("Assistant: ", end="", flush=True)
-    start = time.perf_counter()
-
-    def streamer(subword):
-        print(subword, end="", flush=True)
-        return False  # False = keep generating, True would stop early
-
-    try:
-        result = pipe.generate(chat_history, gen_config, streamer)
-        # Claude - comment: generate() still streams token-by-token via the
-        # callback above exactly as before - streamer works the same way
-        # regardless of whether the input is a plain string or a ChatHistory.
-        # The difference is we now also get the final text back afterward,
-        # which we need to append as the assistant's turn.
-        chat_history.append({"role": "assistant", "content": result.texts[0]})
-    except Exception as e:
-        print(f"\n[Generation error: {e}]")
-    finally:
-        elapsed = time.perf_counter() - start
-        print(f"\n[{elapsed:.2f}s]\n")
+    choice = ask_choice("\nPick a model", len(catalog))
+    return catalog[choice - 1] if choice else None
 
 
-def userprompts(pipe):
-    # this gets the user prompt - passes it to the getresponse function()
-    # user can select the cpu/gpu/npu -> handled earlier in modelchoice(), one time per session
+def choose_device(model: LocalModel, detected: tuple[str, ...]) -> Optional[str]:
+    print(f"\n'{model.name}' can run on: {', '.join(model.supports)}")
 
-    print("\nChat session started. Type 'exit' or 'quit' to end.\n")
+    options = []
+    for device in model.supports:
+        present = any(found.startswith(device) for found in detected)
+        label = device if present else f"{device} (not detected on this machine)"
+        options.append((device, label))
 
-    # Claude - comment: start_chat() is deprecated - we now own the
-    # conversation ourselves via ChatHistory and pass it into every
-    # generate() call instead. No matching finish_chat() call needed below
-    # since there's no pipeline-side chat state left to close out.
-    chat_history = ov_genai.ChatHistory()
+    for index, (_, label) in enumerate(options, start=1):
+        print(f"  {index}. {label}")
+
+    choice = ask_choice("\nPick a device", len(options))
+    if choice is None:
+        return None
+
+    device, _ = options[choice - 1]
+
+    if not any(found.startswith(device) for found in detected):
+        confirm = input(f"OpenVINO doesn't see a {device}. Try anyway? (y/n): ")
+        if confirm.strip().lower() != "y":
+            return None
+
+    return device
+
+
+def run_chat_loop(session: ChatSession) -> None:
+    print("\nChat session started. Type 'exit' or 'quit' to return to the menu.\n")
 
     while True:
         try:
             prompt = input("You: ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nInterrupted.")
-            break
+            print("\nLeaving chat.")
+            return
 
         if prompt.lower() in ("exit", "quit"):
-            break
+            return
         if not prompt:
             continue
 
-        getresponse(pipe, chat_history, prompt)
+        print("Assistant: ", end="", flush=True)
+        started = time.perf_counter()
+
+        def show(chunk: str) -> None:
+            print(chunk, end="", flush=True)
+
+        try:
+            session.ask(prompt, on_token=show)
+        except AssistantError as exc:
+            print(f"\n[{exc}]\n")
+            continue
+
+        print(f"\n[{time.perf_counter() - started:.2f}s]\n")
 
 
-def footer():
-    print("Session ended. Thanks for using the assistant.")
-    # print("Copyright Product : Shouldnt be used without permission of the Admin")
-    # yeah write some crap here lol
-    return
+# ============================================================
+# FEATURES
+# ============================================================
+
+@dataclass(frozen=True)
+class Feature:
+    label: str
+    description: str
+    models: tuple[LocalModel, ...] = ()
+    handler: Optional[Callable[[Feature, tuple[str, ...]], None]] = None
+    planned_for: str = ""
+
+    @property
+    def is_available(self) -> bool:
+        return self.handler is not None
+
+    def describe(self) -> str:
+        if self.is_available:
+            return f"{self.label} - {self.description}"
+        return f"{self.label} - {self.description}  [coming in {self.planned_for}]"
 
 
-def main():
-    banner()
-    devices()
+def run_ideas(feature: Feature, detected_devices: tuple[str, ...]) -> None:
+    model = choose_model(feature.models)
+    if model is None:
+        return
 
-    models = localmodels()
+    if not ensure_model_available(model):
+        return
 
-    # Claude - comment: default/base model is always the first entry in the
-    # dict (matches the existing "only one uncommented entry" convention) -
-    # forced download happens here, before the model picker is ever shown,
-    # per the beta requirement that first install cannot proceed without it.
-    default_model = next(iter(models.values()))
-    ensure_base_model(default_model)
+    device = choose_device(model, detected_devices)
+    if device is None:
+        return
 
-    model, device = modelchoice(models)
+    pipeline = load_pipeline(model, device)
+    session = ChatSession(pipeline)
+    started_at = datetime.now()
 
-    pipe = load_pipeline(model, device)
+    run_chat_loop(session)
 
-    userprompts(pipe)
+    if session.turn_count:
+        save_session(feature.label, session, started_at)
+        print(f"\n({session.turn_count} exchanges saved to memory)")
 
-    footer()
-    return
 
-# NOTE - RESPONSE IS GIVEN TOKEN BY TOKEN!! - just like other llm's
+def run_manage_models(feature: Feature, detected_devices: tuple[str, ...]) -> None:
+    installed = [model for model in list_all_models() if model.is_installed]
+
+    if not installed:
+        print("\nNo models are currently installed.")
+        return
+
+    print("\nInstalled models:")
+    for index, model in enumerate(installed, start=1):
+        tag = " (required, cannot remove)" if model is BASE_MODEL else ""
+        size = format_bytes(folder_size_bytes(model.path))
+        print(f"  {index}. {model.name} - {size}{tag}")
+
+    choice = ask_choice("\nUninstall which model", len(installed))
+    if choice is None:
+        return
+
+    model = installed[choice - 1]
+    if model is BASE_MODEL:
+        print("\nThe base model is required and cannot be removed.")
+        return
+
+    confirm = input(
+        f"Remove '{model.name}'? You'll need to re-download it to use this "
+        f"feature again. (y/n): "
+    )
+    if confirm.strip().lower() != "y":
+        return
+
+    uninstall_model(model)
+    print(f"\n'{model.name}' removed.")
+
+
+FEATURES: tuple[Feature, ...] = (
+    Feature(
+        label="Ideas",
+        description="chat, capture and refine ideas offline",
+        models=IDEA_MODELS,
+        handler=run_ideas,
+    ),
+    Feature(
+        label="Image Generation",
+        description="describe an image and generate it locally",
+        models=IMAGE_MODELS,
+        planned_for="v2",
+    ),
+    Feature(
+        label="Text to Speech",
+        description="read text aloud",
+        models=SPEECH_MODELS,
+        planned_for="v2",
+    ),
+    Feature(
+        label="Music Generation",
+        description="generate short audio pieces",
+        models=MUSIC_MODELS,
+        planned_for="v3",
+    ),
+    Feature(
+        label="Go Online",
+        description="send queries to external AI APIs (needs internet + API key)",
+        planned_for="v5",
+    ),
+    Feature(
+        label="Manage Models",
+        description="view installed models and free up disk space",
+        handler=run_manage_models,
+    ),
+)
+
+
+def run_menu(detected_devices: tuple[str, ...]) -> None:
+    while True:
+        print("\n" + "-" * 50)
+        print("What would you like to do?")
+        print("-" * 50)
+
+        for index, feature in enumerate(FEATURES, start=1):
+            print(f"  {index}. {feature.describe()}")
+        print("  0. Exit")
+
+        choice = ask_choice("\nChoose", len(FEATURES))
+        if choice is None:
+            return
+
+        feature = FEATURES[choice - 1]
+
+        if not feature.is_available:
+            print(f"\n'{feature.label}' isn't implemented yet - planned for {feature.planned_for}.")
+            continue
+
+        try:
+            feature.handler(feature, detected_devices)
+        except AssistantError as exc:
+            print(f"\n[{feature.label}] {exc}\n")
+        except KeyboardInterrupt:
+            print("\nInterrupted - returning to the menu.\n")
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+def main() -> int:
+    print_banner()
+
+    try:
+        ensure_openvino()
+        detected_devices = print_environment()
+        ensure_base_model()
+        run_menu(detected_devices)
+    except AssistantError as exc:
+        print(f"\nERROR: {exc}\n")
+        log_error("AssistantError reached main()", exc)
+        pause_before_exit()
+        return 1
+    except KeyboardInterrupt:
+        print("\n\nInterrupted.")
+        return 1
+    except Exception as exc:
+        print(f"\nUNEXPECTED ERROR: {exc}")
+        log_error("Unhandled exception reached main()", exc)
+        pause_before_exit()
+        return 1
+
+    print_footer()
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 
 
-# TO refactor the entire codebase. -- DONE for this pass.
-# exception handling to be done for the bellow codebase ideas for future. -- DONE (import, model load, generation, ctrl-c/EOF on input)
-# use subprocess to identify whether openvino is installed in the system or not - if not installed then install it via the command -- DONE
-# user to pick up the model -- DONE
-# user to pick between cpu,gpu,npu -- DONE
-# user gives the prompt - the model should remember the chat history for the session only for now. -- DONE, now via a ChatHistory object passed into generate() each turn (Claude - comment: start_chat()/finish_chat() were deprecated by OpenVINO and have been removed, see getresponse()/userprompts())
-# the model should use dynamic tokens for response as much as it sees fit. -- DONE, model self-stops on EOS, max_new_tokens is just a safety ceiling
-# do something to make sure that the model updates accoringly by the internet.
-# fetches whatever it doeesnt know from the internet - always internet since always is connected that should be the priority - fallback patch the offline works as much as it knows to provide without the internet - dont implement api's yet - for now local models are enough
-# ^ still not implemented on purpose per the note above - no APIs yet, local-only for this pass
-
-
-# == FINAL TOUCH BEFORE BETA ==
-# to add auto update and a default model to talk to. -- Claude - comment: DONE, see ensure_base_model() above
-# 1st time application install - the model is actually not added to the .exe so wifi during the locallm install is recommended
-# with the wifi in place first this app will get instaalled say - user selected D drive - then with the intenet the model gets installed - default model only.
-# remainng modle if needed can be download by user by goinng to model name and clicking on add model -
-# Claude - comment: manual "add model" UI for the extra commented-out models above is still a TODO - not part of this pass, beta only needs the one forced base model
-
-# == ALPHA CODE READY ++
-# == MOVING TO BETA - THAT IS BUILD V1 ++
+# ============================================================
+# SUMMARY - resolved from the original draft's inline TODOs
+# ============================================================
+#
+# IMPLEMENTED THIS PASS
+#   - Install-root-anchored paths (matches the real download_model_OpenVINO/
+#     models/ folder layout); correct hf_repo (llmware/qwen2.5-1.5b-instruct-ov)
+#   - ChatHistory-based memory, replacing deprecated start_chat()/finish_chat()
+#   - StreamingStatus-based streamer return value, replacing the removed
+#     bool return (OpenVINO 2026.0.0)
+#   - Download size shown before every install confirmation
+#   - has_internet() fails fast (3s timeout) instead of hanging on a dead network
+#   - Idea/chat memory: every Ideas session is saved to data/memory.db
+#     (feature, start/end timestamps, turn count, full history as JSON) -
+#     this is the "saves idea with date and time stamp" requirement from
+#     the original project spec
+#   - Manage Models menu: lists installed models with disk size, lets you
+#     uninstall any of them except the mandatory base model
+#   - Menu is generated entirely from the FEATURES registry - a feature
+#     cannot exist in the menu without a working handler, or vice versa
+#
+# DROPPED (not deferred - actively removed)
+#   - "Automate model registration" - contradicts your own stated
+#     preference to add models yourself so you're actually reviewing code,
+#     not copy-pasting. Models are added by writing one LocalModel entry
+#     and listing it in the relevant *_MODELS tuple.
+#
+# IMPLEMENTED - CRASH VISIBILITY, AND THE ACTUAL ROOT CAUSE (CONFIRMED)
+#   - Two earlier fix attempts (upgrading huggingface_hub, shortening the
+#     install path) both targeted the wrong cause - neither was it. The real
+#     problem was invisible until the crash-visibility work below let the
+#     actual error surface for the first time.
+#   - main() now has a genuine catch-all beneath AssistantError/
+#     KeyboardInterrupt: nothing can escape as a raw, unexplained traceback.
+#   - Every failure path calls log_error() (full timestamped traceback to
+#     data/crash.log) and pause_before_exit() (holds the window open) - so a
+#     failure is always readable, regardless of what causes it.
+#   - The previously-unguarded model.path.parent.mkdir() call in
+#     download_model() is now wrapped.
+#   - CONFIRMED ROOT CAUSE: has_internet() opened a raw socket directly to
+#     1.1.1.1:53 (Cloudflare DNS). That check was itself failing even though
+#     real HTTPS access to Hugging Face worked fine moments earlier in the
+#     same run (fetch_download_size succeeded) - proof the check was testing
+#     the wrong thing, not that the network was actually down. Likely cause:
+#     a network that allows normal HTTPS but blocks direct external DNS
+#     lookups (common on campus/hostel networks).
+#   - FIXED: has_internet() now makes a real HTTPS HEAD request to Hugging
+#     Face itself - the actual service being depended on - instead of
+#     testing an unrelated capability. Uses only the stdlib (urllib), no new
+#     dependency.
+#
+# DEFERRED - NEXT PHASE
+#   - PySide6 GUI: everything above the "CONSOLE UI" section is UI-agnostic
+#     and gets reused as-is; only that section gets replaced. load_pipeline()
+#     and ChatSession.ask() block, so both must run on a worker thread or
+#     the window freezes during load/generation.
+#
+# DEFERRED - LATER VERSIONS
+#   - Image generation, text-to-speech (v2); music generation (v3)
+#   - Go Online / external API mode (v5)
+#   - Browsing/searching past saved ideas, and a freeform notepad separate
+#     from Ideas - both fit more naturally as GUI panels than console menus
+#   - Auto-update - needs a hosted release/version manifest, out of scope here
+#   - Normalising memory.db into per-message rows instead of one JSON blob
+#     per session, if you ever need to search inside past conversations
+#
+# PACKAGING REMINDER
+#   - Do not bundle models into the .exe - keep it small, download on first
+#     run. Consider shipping one small model preinstalled for demo machines.

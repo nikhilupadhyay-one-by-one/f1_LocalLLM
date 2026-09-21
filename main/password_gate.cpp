@@ -342,9 +342,18 @@ int main() {
     system(command.c_str());
 
     // NOTE THAT AFTER STARTING THE PYTHON PROGRAM - THE CPP FILE SHOULD TRACK THE CPU,GPU,NPU,RAM in real time - of the .py file specifically.
-    // CHECK FOR UPDATES... FEATURE TO BE ADDED IN V2.
+    // CHECK FOR UPDATES... FEATURE TO BE ADDED IN V5.
     // Claude - comment: monitoring intentionally still not implemented here -
     // per your beta scope, this stays off but the structure (this comment,
     // this exact spot in main) is preserved so v2 slots in without a rewrite.
     return 0;
 }
+
+
+// USER_ADMIN - COMMENT - to be added
+// implement real time monitoring - of all devices available including ram/disk/cpu/gpu/npu
+// show details like ram size - speed and usage, cpu model and usage, same for everything - name, usage current out of total bandwidth - of the app only -> opens in new window right after the authentication is successfull and python launches -> should have a kill switch in case .python progrmam crashes and hangs.
+// reorganize the entire codebase - refactor it complelty make it very readable and humanlike. and i really mean very readable - like you can use functions for literally anything - or even oops, stl - anything just make sure its readable and friendly
+// whatever comments you write - write as claude comment - as done above - it should be there as reference.
+
+// NOTE THAT AT THE END THE MONITORING IS SUPPOSED TO BE ALL IN 1 APP SO IT DOESNT REALLY MATTER NOW

@@ -40,8 +40,15 @@ This project is dedicated to the LocalLLM implementation — a local LLM that ru
 - Nuitka (primary) / PyInstaller (fallback) — bundling the Python half for end users without a Python install
 
 **AI**
-
 Honorable mentions to the AI tools that assisted in building this product:
 - Claude — codebase and backend
 - ChatGPT — codebase review and bug fixes
 - Copilot — icon and wallpaper generation
+
+
+**OPTIONS SUPPORTED**
+1. Ideas
+2. Music
+3. Img Gen
+4. ???
+5. GO ONLINE!! (Requires your API key - The Memories of the model is restricted off limits to your online mode)
